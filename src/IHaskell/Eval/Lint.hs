@@ -81,14 +81,15 @@ showIdea :: Idea -> Maybe LintSuggestion
 showIdea idea =
   case ideaTo idea of
     Nothing -> Nothing
-    Just whyNot -> Just
-                     Suggest
-                       { line = srcSpanStartLine $ ideaSpan idea
-                       , found = showSuggestion $ ideaFrom idea
-                       , whyNot = showSuggestion whyNot
-                       , severity = ideaSeverity idea
-                       , suggestion = ideaHint idea
-                       }
+    Just whyNot ->
+      Just
+        Suggest
+          { line = srcSpanStartLine $ ideaSpan idea
+          , found = showSuggestion $ ideaFrom idea
+          , whyNot = showSuggestion whyNot
+          , severity = ideaSeverity idea
+          , suggestion = ideaHint idea
+          }
 
 createModule :: ParseMode -> Located CodeBlock -> Maybe ExtsModule
 createModule mode (Located line block) =
@@ -187,7 +188,7 @@ htmlSuggestions = concatMap toHtml
             _ -> "warning"
 
     style :: String -> String -> String
-    style =  printf "<div class=\"suggestion-%s\">%s</div>"
+    style = printf "<div class=\"suggestion-%s\">%s</div>"
 
     named :: String -> String
     named = printf "<div class=\"suggestion-name\" style=\"clear:both;\">%s</div>"

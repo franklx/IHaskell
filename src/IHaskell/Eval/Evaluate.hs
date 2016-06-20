@@ -7,6 +7,8 @@ This module exports all functions used for evaluation of IHaskell input.
 -}
 module IHaskell.Eval.Evaluate (
     interpret,
+    testInterpret,
+    testEvaluate,
     evaluate,
     flushWidgetMessages,
     Interpreter,
@@ -36,7 +38,7 @@ import           System.Directory
 import           System.Posix.IO (createPipe)
 #endif
 import           System.Posix.IO (fdToHandle)
-import           System.IO (hGetChar, hFlush)
+import           System.IO (hGetChar, hSetEncoding, utf8, hFlush)
 import           System.Random (getStdGen, randomRs)
 import           Unsafe.Coerce
 import           Control.Monad (guard)
@@ -48,6 +50,7 @@ import qualified MonadUtils (MonadIO, liftIO)
 import           System.Environment (getEnv)
 import qualified Data.Map as Map
 
+import qualified GHC.Paths
 import           NameSet
 import           Name
 import           PprTyThing
@@ -145,6 +148,15 @@ ihaskellGlobalImports =
   , "import qualified IHaskell.Eval.Widgets"
   ]
 
+-- | Interpreting function for testing.
+testInterpret :: Interpreter a -> IO a
+testInterpret val = interpret GHC.Paths.libdir False (const val)
+
+-- | Evaluation function for testing.
+testEvaluate :: String -> IO ()
+testEvaluate str = void $ testInterpret $
+  evaluate defaultKernelState str (const $ return ()) (\state _ -> return state)
+
 -- | Run an interpreting action. This is effectively runGhc with initialization and importing. First
 -- argument indicates whether `stdin` is handled specially, which cannot be done in a testing
 -- environment. The argument passed to the action indicates whether Haskell support libraries are
@@ -203,10 +215,11 @@ initializeImports = do
         let idString = packageIdString' dflags (packageConfigId dep)
         guard (iHaskellPkgName `isPrefixOf` idString)
 
-      displayPkgs = [pkgName | pkgName <- packageNames
-                             , Just (x:_) <- [stripPrefix initStr pkgName]
-                             , pkgName `notElem` broken
-                             , isAlpha x]
+      displayPkgs = [ pkgName
+                    | pkgName <- packageNames 
+                    , Just (x:_) <- [stripPrefix initStr pkgName] 
+                    , pkgName `notElem` broken 
+                    , isAlpha x ]
 
       hasIHaskellPackage = not $ null $ filter (== iHaskellPkgName) packageNames
 
@@ -257,7 +270,7 @@ data EvalOut =
          { evalStatus :: ErrorOccurred
          , evalResult :: Display
          , evalState :: KernelState
-         , evalPager :: String
+         , evalPager :: [DisplayData]
          , evalMsgs :: [WidgetMsg]
          }
 
@@ -320,18 +333,25 @@ evaluate kernelState code output widgetHandler = do
 
       -- Get displayed channel outputs. Merge them with normal display outputs.
       dispsMay <- if supportLibrariesAvailable state
-                    then extractValue "IHaskell.Display.displayFromChan" >>= liftIO
+                    then do
+                      getEncodedDisplays <- extractValue "IHaskell.Display.displayFromChanEncoded"
+                      case getEncodedDisplays of
+                        Left err -> error $ "Deserialization error (Evaluate.hs): " ++ err
+                        Right displaysIO -> do
+                          result <- liftIO displaysIO
+                          case Serialize.decode result of
+                            Left err  -> error $ "Deserialization error (Evaluate.hs): " ++ err
+                            Right res -> return res
                     else return Nothing
       let result =
             case dispsMay of
               Nothing    -> evalResult evalOut
               Just disps -> evalResult evalOut <> disps
-          helpStr = evalPager evalOut
 
       -- Output things only if they are non-empty.
-      let empty = noResults result && null helpStr
+      let empty = noResults result && null (evalPager evalOut)
       unless empty $
-        liftIO $ output $ FinalResult result [plain helpStr] []
+        liftIO $ output $ FinalResult result (evalPager evalOut) []
 
       let tempMsgs = evalMsgs evalOut
           tempState = evalState evalOut { evalMsgs = [] }
@@ -349,12 +369,27 @@ evaluate kernelState code output widgetHandler = do
 
 -- | Compile a string and extract a value from it. Effectively extract the result of an expression
 -- from inside the notebook environment.
-extractValue :: Typeable a => String -> Interpreter a
+extractValue :: Typeable a => String -> Interpreter (Either String a)
 extractValue expr = do
   compiled <- dynCompileExpr expr
   case fromDynamic compiled of
-    Nothing     -> error "Error casting types in Evaluate.hs"
-    Just result -> return result
+    Nothing     -> return (Left multipleIHaskells)
+    Just result -> return (Right result)
+
+  where
+    multipleIHaskells =
+      concat
+        [ "The installed IHaskell support libraries do not match"
+        , " the instance of IHaskell you are running.\n"
+        , "This *may* cause problems with functioning of widgets or rich media displays.\n"
+        , "This is most often caused by multiple copies of IHaskell"
+        , " being installed simultaneously in your environment.\n"
+        , "To resolve this issue, clear out your environment and reinstall IHaskell.\n"
+        , "If you are installing support libraries, make sure you only do so once:\n"
+        , "    # Run this without first running `stack install ihaskell`\n"
+        , "    stack install ihaskell-diagrams\n"
+        , "If you continue to have problems, please file an issue on Github."
+        ]
 
 flushWidgetMessages :: KernelState
                     -> [WidgetMsg]
@@ -362,12 +397,19 @@ flushWidgetMessages :: KernelState
                     -> Interpreter KernelState
 flushWidgetMessages state evalMsgs widgetHandler = do
   -- Capture all widget messages queued during code execution
-  messagesIO <- extractValue "IHaskell.Eval.Widgets.relayWidgetMessages"
-  messages <- liftIO messagesIO
+  extracted <- extractValue "IHaskell.Eval.Widgets.relayWidgetMessages"
+  liftIO $
+    case extracted of
+      Left err -> do
+        hPutStrLn stderr "Disabling IHaskell widget support due to an encountered error:"
+        hPutStrLn stderr err
+        return state
+      Right messagesIO -> do
+        messages <- messagesIO
 
-  -- Handle all the widget messages
-  let commMessages = evalMsgs ++ messages
-  liftIO $ widgetHandler state commMessages
+        -- Handle all the widget messages
+        let commMessages = evalMsgs ++ messages
+        widgetHandler state commMessages
 
 safely :: KernelState -> Interpreter EvalOut -> Interpreter EvalOut
 safely state = ghandle handler . ghandle sourceErrorHandler
@@ -379,7 +421,7 @@ safely state = ghandle handler . ghandle sourceErrorHandler
           { evalStatus = Failure
           , evalResult = displayError $ show exception
           , evalState = state
-          , evalPager = ""
+          , evalPager = []
           , evalMsgs = []
           }
 
@@ -398,7 +440,7 @@ safely state = ghandle handler . ghandle sourceErrorHandler
           { evalStatus = Failure
           , evalResult = displayError fullErr
           , evalState = state
-          , evalPager = ""
+          , evalPager = []
           , evalMsgs = []
           }
 
@@ -412,7 +454,7 @@ wrapExecution state exec = safely state $
         { evalStatus = Success
         , evalResult = res
         , evalState = state
-        , evalPager = ""
+        , evalPager = []
         , evalMsgs = []
         }
 
@@ -502,7 +544,7 @@ evalCommand output (Directive SetDynFlag flagsStr) state = safely state $ do
                                                         ]
                            ]
           , evalState = state
-          , evalPager = ""
+          , evalPager = []
           , evalMsgs = []
           }
     else do
@@ -528,7 +570,7 @@ evalCommand output (Directive SetDynFlag flagsStr) state = safely state $ do
           { evalStatus = Success
           , evalResult = display
           , evalState = state'
-          , evalPager = ""
+          , evalPager = []
           , evalMsgs = []
           }
 
@@ -562,7 +604,7 @@ evalCommand a (Directive SetOption opts) state = do
                 { evalStatus = Failure
                 , evalResult = displayError err
                 , evalState = state
-                , evalPager = ""
+                , evalPager = []
                 , evalMsgs = []
                 }
     else let options = mapMaybe findOption $ words opts
@@ -572,7 +614,7 @@ evalCommand a (Directive SetOption opts) state = do
                 { evalStatus = Success
                 , evalResult = mempty
                 , evalState = updater state
-                , evalPager = ""
+                , evalPager = []
                 , evalMsgs = []
                 }
 
@@ -706,7 +748,7 @@ evalCommand _ (Directive GetHelp _) state = do
       { evalStatus = Success
       , evalResult = Display [out]
       , evalState = state
-      , evalPager = ""
+      , evalPager = []
       , evalMsgs = []
       }
 
@@ -738,24 +780,25 @@ evalCommand _ (Directive GetHelp _) state = do
 evalCommand _ (Directive GetInfo str) state = safely state $ do
   write state $ "Info: " ++ str
   -- Get all the info for all the names we're given.
-  strings <- getDescription str
+  strings <- unlines <$> getDescription str
 
-  -- TODO: Make pager work without html by porting to newer architecture
-  let output = unlines (map htmlify strings)
-      htmlify str =
-        printf
-          "<div style='background: rgb(247, 247, 247);'><form><textarea id='code'>%s</textarea></form></div>"
-          str
-        ++ script
-      script =
-        "<script>CodeMirror.fromTextArea(document.getElementById('code'), {mode: 'haskell', readOnly: 'nocursor'});</script>"
+  -- Make pager work without html by porting to newer architecture
+  let htmlify str =
+        html $
+          concat
+            [ "<div style='background: rgb(247, 247, 247);'><form><textarea id='code'>"
+            , str
+            , "</textarea></form></div>"
+            , "<script>CodeMirror.fromTextArea(document.getElementById('code'),"
+            , " {mode: 'haskell', readOnly: 'nocursor'});</script>"
+            ]
 
   return
     EvalOut
       { evalStatus = Success
       , evalResult = mempty
       , evalState = state
-      , evalPager = output
+      , evalPager = [plain strings, htmlify strings]
       , evalMsgs = []
       }
 
@@ -804,7 +847,7 @@ evalCommand output (Expression expr) state = do
           { evalStatus = Success
           , evalResult = mempty
           , evalState = state
-          , evalPager = ""
+          , evalPager = []
           , evalMsgs = []
           }
     else if canRunDisplay
@@ -949,7 +992,7 @@ evalCommand _ (ParseError loc err) state = do
       { evalStatus = Failure
       , evalResult = displayError $ formatParseError loc err
       , evalState = state
-      , evalPager = ""
+      , evalPager = []
       , evalMsgs = []
       }
 
@@ -966,13 +1009,11 @@ hoogleResults state results =
     { evalStatus = Success
     , evalResult = mempty
     , evalState = state
-    , evalPager = output
+    , evalPager = [ plain $ unlines $ map (Hoogle.render Hoogle.Plain) results
+                  , html $ unlines $ map (Hoogle.render Hoogle.HTML) results
+                  ]
     , evalMsgs = []
     }
-  where
-    -- TODO: Make pager work with plaintext
-    fmt = Hoogle.HTML
-    output = unlines $ map (Hoogle.render fmt) results
 
 doLoadModule :: String -> String -> Ghc Display
 doLoadModule name modName = do
@@ -1127,7 +1168,9 @@ capturedEval output stmt = do
   -- Then convert the HValue into an executable bit, and read the value.
   pipe <- liftIO $ do
             fd <- head <$> unsafeCoerce hValues
-            fdToHandle fd
+            handle <- fdToHandle fd
+            hSetEncoding handle utf8
+            return handle
 
   -- Keep track of whether execution has completed.
   completed <- liftIO $ newMVar False
@@ -1216,7 +1259,8 @@ evalStatementOrIO publish state cmd = do
             name == "it" ||
             name == "it" ++ show (getExecutionCounter state)
           nonItNames = filter (not . isItName) allNames
-          output = [plain printed | not . null $ strip printed]
+          output = [ plain printed
+                   | not . null $ strip printed ]
 
       write state $ "Names: " ++ show allNames
 
@@ -1269,14 +1313,17 @@ formatErrorWithClass :: String -> ErrMsg -> String
 formatErrorWithClass cls =
   printf "<span class='%s'>%s</span>" cls .
   replace "\n" "<br/>" .
+  fixDollarSigns .
+  replace "<" "&lt;" .
+  replace ">" "&gt;" .
+  replace "&" "&amp;" .
   replace useDashV "" .
   replace "Ghci" "IHaskell" .
   replace "‘interactive:" "‘" .
-  fixDollarSigns .
   rstrip .
   typeCleaner
   where
-    fixDollarSigns = replace "$" "<span>$</span>"
+    fixDollarSigns = replace "$" "<span>&dollar;</span>"
     useDashV = "\nUse -v to see a list of the files searched for."
     isShowError err =
       "No instance for (Show" `isPrefixOf` err &&
